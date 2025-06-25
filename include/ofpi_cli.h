@@ -24,9 +24,11 @@ struct cli_conn {
 	char          oldbuf[NUM_OLD_BUFS][200];
 	int           old_put_cnt;
 	int           old_get_cnt;
-	unsigned int  pos;
-	unsigned char ch1;
-	char          passwd[PASSWORD_LEN + 1];
+        unsigned int  pos;
+        unsigned int  cursor;
+        unsigned int  last_len;
+        unsigned char ch1;
+        char          passwd[PASSWORD_LEN + 1];
 };
 
 /** utils
