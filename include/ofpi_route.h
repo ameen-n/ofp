@@ -32,6 +32,10 @@ void ofp_route_init_prepare(void);
 int ofp_route_init_global(void);
 int ofp_route_term_global(void);
 
+/* Route cache */
+#define OFP_ROUTE_CACHE_INVALID 0xffffffff
+
+
 enum ofp_return_code ofp_route_save_ipv6_pkt(odp_packet_t pkt, uint8_t *addr,
 		struct ofp_ifnet *dev);
 
