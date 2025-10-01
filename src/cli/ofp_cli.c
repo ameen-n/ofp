@@ -85,40 +85,111 @@ static FILE *history_fp = NULL;
 static const char *cmd_log_path = "/opt/lte/ofp_cmd.log";
 static const char *history_path = "/opt/lte/ofp_cli.history";
 
+static void refresh_line(struct cli_conn *conn);
+
+static void history_reset(struct cli_conn *conn)
+{
+	if (!conn->history)
+		return;
+
+	for (size_t i = 0; i < conn->history_len; i++)
+		free(conn->history[i]);
+
+	free(conn->history);
+	conn->history = NULL;
+	conn->history_len = 0;
+	conn->history_cap = 0;
+	conn->history_index = 0;
+}
+
+static int history_reserve(struct cli_conn *conn, size_t additional)
+{
+	size_t needed = conn->history_len + additional;
+	if (needed <= conn->history_cap)
+		return 1;
+
+	size_t new_cap = conn->history_cap ? conn->history_cap : 16;
+	while (new_cap < needed)
+		new_cap *= 2;
+
+	char **entries = realloc(conn->history, new_cap * sizeof(char *));
+	if (!entries)
+		return 0;
+
+	conn->history = entries;
+	conn->history_cap = new_cap;
+	return 1;
+}
+
+static void history_append(struct cli_conn *conn, const char *line,
+			   int update_index)
+{
+	if (!line || !*line)
+		return;
+
+	if (!history_reserve(conn, 1))
+		return;
+
+	conn->history[conn->history_len] = strdup(line);
+	if (!conn->history[conn->history_len])
+		return;
+
+	conn->history_len++;
+	if (update_index)
+		conn->history_index = conn->history_len;
+}
+
+static void history_select(struct cli_conn *conn, size_t index)
+{
+	if (index > conn->history_len)
+		index = conn->history_len;
+
+	conn->history_index = index;
+
+	if (index >= conn->history_len) {
+		conn->inbuf[0] = '\0';
+		conn->pos = 0;
+		conn->cursor = 0;
+	} else {
+		strncpy(conn->inbuf, conn->history[index],
+				sizeof(conn->inbuf) - 1);
+		conn->inbuf[sizeof(conn->inbuf) - 1] = '\0';
+		conn->pos = strlen(conn->inbuf);
+		conn->cursor = conn->pos;
+	}
+
+	refresh_line(conn);
+}
+
 static void load_history(struct cli_conn *conn)
 {
-       char line[sizeof(conn->inbuf)];
+	char line[sizeof(conn->inbuf)];
 
-       if (!history_fp)
-               return;
+	if (!history_fp)
+		return;
 
-       rewind(history_fp);
-       int cnt = 0;
-       while (fgets(line, sizeof(line), history_fp)) {
-               char *nl = strchr(line, '\n');
-               if (nl)
-                       *nl = '\0';
-               strncpy(conn->oldbuf[cnt % NUM_OLD_BUFS], line,
-                       sizeof(conn->oldbuf[0]) - 1);
-               conn->oldbuf[cnt % NUM_OLD_BUFS][sizeof(conn->oldbuf[0]) - 1] = 0;
-               cnt++;
-       }
-       if (cnt > 0)
-               conn->old_put_cnt = (cnt - 1) % NUM_OLD_BUFS;
-       else
-               conn->old_put_cnt = 0;
-       conn->old_get_cnt = conn->old_put_cnt;
-       fseek(history_fp, 0, SEEK_END);
+	history_reset(conn);
+	rewind(history_fp);
+	while (fgets(line, sizeof(line), history_fp)) {
+		char *nl = strchr(line, '\n');
+		if (nl)
+			*nl = '\0';
+		history_append(conn, line, 0);
+	}
+	conn->history_index = conn->history_len;
+	fseek(history_fp, 0, SEEK_END);
 }
 
 int run_alias = -1;
 
 static void addchars(struct cli_conn *conn, const char *s);
 static void parse(struct cli_conn *conn, int extra);
+static void refresh_line(struct cli_conn *conn);
 
 static void close_connection(struct cli_conn *conn)
 {
-	(void)conn;
+	if (conn)
+		history_reset(conn);
 	OFP_DBG("Closing connection...\r\n");
 	close_cli = 1; /* tell server to close the socket */
 }
@@ -1667,20 +1738,16 @@ static int cli_read(int fd)
 	if (c == 4) { /* ctl-D */
 		close_connection(conn);
 		return 0;
-	} else if (c == 0x10 || c == 0x0e) { /* ctl-P or ctl-N */
-		strcpy(conn->inbuf, conn->oldbuf[conn->old_get_cnt]);
-		if (c == 0x10) {
-			conn->old_get_cnt--;
-			if (conn->old_get_cnt < 0)
-				conn->old_get_cnt = NUM_OLD_BUFS - 1;
-		} else {
-			conn->old_get_cnt++;
-			if (conn->old_get_cnt >= NUM_OLD_BUFS)
-				conn->old_get_cnt = 0;
-		}
-		conn->pos = strlen(conn->inbuf);
-                conn->cursor = conn->pos;
-                refresh_line(conn);
+	} else if (c == 0x10) { /* ctl-P */
+		size_t index = conn->history_index;
+		if (index > 0)
+			index--;
+		history_select(conn, index);
+	} else if (c == 0x0e) { /* ctl-N */
+		size_t index = conn->history_index;
+		if (index < conn->history_len)
+			index++;
+		history_select(conn, index);
 	} else if (c == 0x1b) {
 		conn->status |= WAITING_ESC_1;
 	} else if (c == 0xff) {
@@ -1698,31 +1765,22 @@ static int cli_read(int fd)
 	char nl[] = {13, 10};
 	if (conn->status & DO_ECHO)
 		send(fd, nl, sizeof(nl), 0);
-        conn->inbuf[conn->pos] = 0;
-       if (cmd_log_fp && conn->pos) {
-               time_t now = time(NULL);
-               struct tm tm_now;
-               char tbuf[32];
-               localtime_r(&now, &tm_now);
-               strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tm_now);
-               fprintf(cmd_log_fp, "%s %s\n", tbuf, conn->inbuf);
-               fflush(cmd_log_fp);
-       }
-       if (history_fp && conn->pos) {
-               fprintf(history_fp, "%s\n", conn->inbuf);
-               fflush(history_fp);
-       }
-	if (0 && conn->pos == 0) {
-		strcpy(conn->inbuf, conn->oldbuf[conn->old_put_cnt]);
-		conn->pos = strlen(conn->inbuf);
-		sendstr(conn, conn->inbuf);
-		send(fd, nl, sizeof(nl), 0);
-	} else if (conn->pos > 0 && strcmp(conn->oldbuf[conn->old_put_cnt], conn->inbuf)) {
-		conn->old_put_cnt++;
-		if (conn->old_put_cnt >= NUM_OLD_BUFS)
-			conn->old_put_cnt = 0;
-		strcpy(conn->oldbuf[conn->old_put_cnt], conn->inbuf);
+	conn->inbuf[conn->pos] = 0;
+	if (cmd_log_fp && conn->pos) {
+		time_t now = time(NULL);
+		struct tm tm_now;
+		char tbuf[32];
+		localtime_r(&now, &tm_now);
+		strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tm_now);
+		fprintf(cmd_log_fp, "%s %s\n", tbuf, conn->inbuf);
+		fflush(cmd_log_fp);
 	}
+	if (history_fp && conn->pos) {
+		fprintf(history_fp, "%s\n", conn->inbuf);
+		fflush(history_fp);
+	}
+	if (conn->pos > 0)
+		history_append(conn, conn->inbuf, 1);
 
 	if (conn->pos) {
 		parse(conn, 0);
@@ -1735,12 +1793,12 @@ static int cli_read(int fd)
 	} else
 		sendcrlf(conn);
 
-        conn->pos = 0;
-        conn->cursor = 0;
-        conn->last_len = 0;
-        conn->inbuf[0] = 0;
-        conn->old_get_cnt = conn->old_put_cnt;
-        } else if (c == 8 || c == 127) {
+	conn->pos = 0;
+	conn->cursor = 0;
+	conn->last_len = 0;
+	conn->inbuf[0] = 0;
+	conn->history_index = conn->history_len;
+	} else if (c == 8 || c == 127) {
                 if (conn->cursor > 0) {
                         memmove(&conn->inbuf[conn->cursor - 1],
                                 &conn->inbuf[conn->cursor],
@@ -1750,29 +1808,29 @@ static int cli_read(int fd)
                         conn->inbuf[conn->pos] = 0;
                         refresh_line(conn);
                 }
-        } else if (c == 0x02) {
+	} else if (c == 0x02) {
                 if (conn->cursor > 0) {
                         conn->cursor--;
                         refresh_line(conn);
                 }
-        } else if (c == 0x06) {
+	} else if (c == 0x06) {
                 if (conn->cursor < conn->pos) {
                         conn->cursor++;
                         refresh_line(conn);
                 }
-        } else if (c == 0x01) {
+	} else if (c == 0x01) {
                 if (conn->cursor) {
                         conn->cursor = 0;
                         refresh_line(conn);
                 }
-        } else if (c == 0x05) {
+	} else if (c == 0x05) {
                 if (conn->cursor != conn->pos) {
                         conn->cursor = conn->pos;
                         refresh_line(conn);
                 }
-        } else if (c == '?' || c == '\t') {
+	} else if (c == '?' || c == '\t') {
                 parse(conn, c);
-        } else if (c >= ' ' && c < 127) {
+	} else if (c >= ' ' && c < 127) {
                 if (conn->pos < (sizeof(conn->inbuf) - 1)) {
                         if (conn->cursor == conn->pos) {
                                 conn->inbuf[conn->pos++] = c;
@@ -1797,6 +1855,7 @@ static void cli_sa_accept(int fd)
         struct cli_conn *conn;
 
         conn = &connection;
+        history_reset(conn);
         bzero(conn, sizeof(*conn));
        load_history(conn);
         conn->fd = fd;
@@ -1958,10 +2017,11 @@ static int cli_server(void *arg)
         cli_serv_fd = -1;
 
         OFP_DBG("CLI server exiting");
-       if (cmd_log_fp)
-               fclose(cmd_log_fp);
-       if (history_fp)
-               fclose(history_fp);
+	history_reset(&connection);
+	if (cmd_log_fp)
+		fclose(cmd_log_fp);
+	if (history_fp)
+		fclose(history_fp);
        ofp_term_local();
        return 0;
 }
