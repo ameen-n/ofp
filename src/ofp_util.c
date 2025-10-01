@@ -262,20 +262,23 @@ char *ofp_port_vlan_to_ifnet_name(int port, int vlan)
 
 int ofp_sendf(int fd, const char *fmt, ...)
 {
-	char buf[1024];
-	int ret, n;
-	va_list ap;
-	struct stat statbuf;
+        char buf[1024];
+        int ret, n;
+        va_list ap;
+        struct stat statbuf;
 
-	va_start(ap, fmt);
-	n = vsnprintf(buf, sizeof(buf), fmt, ap);
-	va_end(ap);
+        if (fd < 0)
+                return 0;
 
-	fstat(fd, &statbuf);
-	if (S_ISSOCK(fd))
-		ret = send(fd, buf, n, 0);
-	else
-		ret = write(fd, buf, n);
+        va_start(ap, fmt);
+        n = vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
 
-	return ret;
+        fstat(fd, &statbuf);
+        if (S_ISSOCK(fd))
+                ret = send(fd, buf, n, 0);
+        else
+                ret = write(fd, buf, n);
+
+        return ret;
 }

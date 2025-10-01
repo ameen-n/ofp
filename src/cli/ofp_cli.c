@@ -450,10 +450,12 @@ int ip6addr_get(const char *tk, int tk_len, uint8_t *addr)
 
 static void sendstr(struct cli_conn *conn, const char *s)
 {
-	if (S_ISSOCK(conn->fd))
-		send(conn->fd, s, strlen(s), 0);
-	else
-		(void)(write(conn->fd, s, strlen(s)) + 1);
+        if (conn->fd < 0)
+                return;
+        if (S_ISSOCK(conn->fd))
+                send(conn->fd, s, strlen(s), 0);
+        else
+                (void)(write(conn->fd, s, strlen(s)) + 1);
 }
 
 void sendcrlf(struct cli_conn *conn)
@@ -1259,10 +1261,10 @@ static void cli_init_commands(void)
 
 	initialized = 1;
 
-	/* virtual connection */
-	memset(&conn, 0, sizeof(conn));
-	conn.fd = 1; /* stdout */
-	conn.status = CONNECTION_ON; /* no prompt */
+        /* virtual connection */
+        memset(&conn, 0, sizeof(conn));
+        conn.fd = -1; /* suppress output */
+        conn.status = CONNECTION_ON; /* no prompt */
 
 
 	/* Initalize alias table*/
@@ -1290,10 +1292,10 @@ static void cli_process_file(char *file_name)
 	FILE *f;
 	struct cli_conn conn;
 
-	/* virtual connection */
-	memset(&conn, 0, sizeof(conn));
-	conn.fd = 1; /* stdout */
-	conn.status = CONNECTION_ON; /* no prompt */
+        /* virtual connection */
+        memset(&conn, 0, sizeof(conn));
+        conn.fd = -1; /* suppress output */
+        conn.status = CONNECTION_ON; /* no prompt */
 
 	if (file_name != NULL) {
 		f = fopen(file_name, "r");
