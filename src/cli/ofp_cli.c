@@ -74,19 +74,122 @@ struct cli_command {
 #define WAITING_TELNET_2	32
 #define WAITING_ESC_1		64
 #define WAITING_ESC_2		128
-#define WAITING_PASSWD		256
-#define ENABLED_OK		512
+#define WAITING_ESC_DEL		256
+#define WAITING_PASSWD		512
+#define ENABLED_OK		1024
 
 static struct cli_conn connection;
+/* File pointers and paths for logging and history */
+static FILE *cmd_log_fp = NULL;
+static FILE *history_fp = NULL;
+static const char *cmd_log_path = "/opt/lte/ofp_cmd.log";
+static const char *history_path = "/opt/lte/ofp_cli.history";
+
+static void refresh_line(struct cli_conn *conn);
+
+static void history_reset(struct cli_conn *conn)
+{
+	if (!conn->history)
+		return;
+
+	for (size_t i = 0; i < conn->history_len; i++)
+		free(conn->history[i]);
+
+	free(conn->history);
+	conn->history = NULL;
+	conn->history_len = 0;
+	conn->history_cap = 0;
+	conn->history_index = 0;
+}
+
+static int history_reserve(struct cli_conn *conn, size_t additional)
+{
+	size_t needed = conn->history_len + additional;
+	if (needed <= conn->history_cap)
+		return 1;
+
+	size_t new_cap = conn->history_cap ? conn->history_cap : 16;
+	while (new_cap < needed)
+		new_cap *= 2;
+
+	char **entries = realloc(conn->history, new_cap * sizeof(char *));
+	if (!entries)
+		return 0;
+
+	conn->history = entries;
+	conn->history_cap = new_cap;
+	return 1;
+}
+
+static void history_append(struct cli_conn *conn, const char *line,
+			   int update_index)
+{
+	if (!line || !*line)
+		return;
+
+	if (!history_reserve(conn, 1))
+		return;
+
+	conn->history[conn->history_len] = strdup(line);
+	if (!conn->history[conn->history_len])
+		return;
+
+	conn->history_len++;
+	if (update_index)
+		conn->history_index = conn->history_len;
+}
+
+static void history_select(struct cli_conn *conn, size_t index)
+{
+	if (index > conn->history_len)
+		index = conn->history_len;
+
+	conn->history_index = index;
+
+	if (index >= conn->history_len) {
+		conn->inbuf[0] = '\0';
+		conn->pos = 0;
+		conn->cursor = 0;
+	} else {
+		strncpy(conn->inbuf, conn->history[index],
+				sizeof(conn->inbuf) - 1);
+		conn->inbuf[sizeof(conn->inbuf) - 1] = '\0';
+		conn->pos = strlen(conn->inbuf);
+		conn->cursor = conn->pos;
+	}
+
+	refresh_line(conn);
+}
+
+static void load_history(struct cli_conn *conn)
+{
+	char line[sizeof(conn->inbuf)];
+
+	if (!history_fp)
+		return;
+
+	history_reset(conn);
+	rewind(history_fp);
+	while (fgets(line, sizeof(line), history_fp)) {
+		char *nl = strchr(line, '\n');
+		if (nl)
+			*nl = '\0';
+		history_append(conn, line, 0);
+	}
+	conn->history_index = conn->history_len;
+	fseek(history_fp, 0, SEEK_END);
+}
 
 int run_alias = -1;
 
 static void addchars(struct cli_conn *conn, const char *s);
 static void parse(struct cli_conn *conn, int extra);
+static void refresh_line(struct cli_conn *conn);
 
 static void close_connection(struct cli_conn *conn)
 {
-	(void)conn;
+	if (conn)
+		history_reset(conn);
 	OFP_DBG("Closing connection...\r\n");
 	close_cli = 1; /* tell server to close the socket */
 }
@@ -418,28 +521,30 @@ int ip6addr_get(const char *tk, int tk_len, uint8_t *addr)
 
 static void sendstr(struct cli_conn *conn, const char *s)
 {
-	if (S_ISSOCK(conn->fd))
-		send(conn->fd, s, strlen(s), 0);
-	else
-		(void)(write(conn->fd, s, strlen(s)) + 1);
+        if (conn->fd < 0)
+                return;
+        if (S_ISSOCK(conn->fd))
+                send(conn->fd, s, strlen(s), 0);
+        else
+                (void)(write(conn->fd, s, strlen(s)) + 1);
 }
 
 void sendcrlf(struct cli_conn *conn)
 {
 	if ((conn->status & DO_ECHO) == 0)
 		sendstr(conn, "\n"); /* no extra prompts */
-	else if (conn->status & ENABLED_OK)
-		sendstr(conn, "\r\n# ");
-	else
-		sendstr(conn, "\r\n> ");
+       else if (conn->status & ENABLED_OK)
+               sendstr(conn, "\r\nCLI# ");
+       else
+               sendstr(conn, "\r\nCLI> ");
 }
 
 static void sendprompt(struct cli_conn *conn)
 {
-	if (conn->status & ENABLED_OK)
-		sendstr(conn, "\r# ");
-	else
-		sendstr(conn, "\r> ");
+       if (conn->status & ENABLED_OK)
+               sendstr(conn, "\rCLI# ");
+       else
+               sendstr(conn, "\rCLI> ");
 }
 
 static void cli_send_welcome_banner(int fd)
@@ -1227,10 +1332,10 @@ static void cli_init_commands(void)
 
 	initialized = 1;
 
-	/* virtual connection */
-	memset(&conn, 0, sizeof(conn));
-	conn.fd = 1; /* stdout */
-	conn.status = CONNECTION_ON; /* no prompt */
+        /* virtual connection */
+        memset(&conn, 0, sizeof(conn));
+        conn.fd = -1; /* suppress output */
+        conn.status = CONNECTION_ON; /* no prompt */
 
 
 	/* Initalize alias table*/
@@ -1258,10 +1363,10 @@ static void cli_process_file(char *file_name)
 	FILE *f;
 	struct cli_conn conn;
 
-	/* virtual connection */
-	memset(&conn, 0, sizeof(conn));
-	conn.fd = 1; /* stdout */
-	conn.status = CONNECTION_ON; /* no prompt */
+        /* virtual connection */
+        memset(&conn, 0, sizeof(conn));
+        conn.fd = -1; /* suppress output */
+        conn.status = CONNECTION_ON; /* no prompt */
 
 	if (file_name != NULL) {
 		f = fopen(file_name, "r");
@@ -1457,20 +1562,21 @@ static void parse(struct cli_conn *conn, int extra)
 			return;
 		}
 
-		found = find_next_vertical(horpos, *token);
+               found = find_next_vertical(horpos, *token);
 
-		if (found) {
-			addchars(conn, found->word + strlen(*token));
-			addchars(conn, " ");
-			sendstr(conn, found->word + strlen(*token));
-			sendstr(conn, " ");
-			return;
-		}
+               if (found) {
+                       addchars(conn, found->word + strlen(*token));
+                       addchars(conn, " ");
+                       sendstr(conn, found->word + strlen(*token));
+                       sendstr(conn, " ");
+                       return;
+               }
 
-		print_q(conn, horpos, lastok);
-		sendstr(conn, line);
-		return;
-	}
+               sendstr(conn, "\a");
+               print_q(conn, horpos, lastok);
+               sendstr(conn, line);
+               return;
+       }
 
 	sendstr(conn, "syntax error\r\n");
 	sendcrlf(conn);
@@ -1485,8 +1591,33 @@ static char telnet_echo_off[] = {
 
 static void addchars(struct cli_conn *conn, const char *s)
 {
-	strcat(conn->inbuf, s);
-	conn->pos += strlen(s);
+        strcat(conn->inbuf, s);
+        conn->pos += strlen(s);
+        conn->cursor = conn->pos;
+}
+
+static void refresh_line(struct cli_conn *conn)
+{
+        if (!(conn->status & DO_ECHO))
+                return;
+
+        sendstr(conn, "\r");
+        sendprompt(conn);
+        if (conn->pos)
+                send(conn->fd, conn->inbuf, conn->pos, 0);
+
+        if (conn->last_len > conn->pos) {
+                unsigned int diff = conn->last_len - conn->pos;
+                for (unsigned int i = 0; i < diff; i++)
+                        send(conn->fd, " ", 1, 0);
+                for (unsigned int i = 0; i < diff; i++)
+                        send(conn->fd, "\b", 1, 0);
+        }
+
+        for (unsigned int i = conn->pos; i > conn->cursor; i--)
+                send(conn->fd, "\b", 1, 0);
+
+        conn->last_len = conn->pos;
 }
 
 
@@ -1557,53 +1688,66 @@ static int cli_read(int fd)
 		conn->status &= ~WAITING_ESC_1;
 		conn->status |= WAITING_ESC_2;
 		return 0;
-	} else if (conn->status & WAITING_ESC_2) {
-		conn->status &= ~WAITING_ESC_2;
-		if (conn->ch1 != 0x5b)
-			return 0;
+       } else if (conn->status & WAITING_ESC_2) {
+               conn->status &= ~WAITING_ESC_2;
+               if (conn->ch1 != 0x5b)
+                       return 0;
 
-		switch (c) {
-		case 0x41: // up
-			c = 0x10; /* arrow up = ctl-P */
-			break;
-		case 0x42: // down
-			c = 0x0e; /* arrow down = ctl-N */
-			break;
-		case 0x44: // left
-			c = 8;    /* arrow left = backspace */
-			break;
-		case 0x31: // home
-			cli_curses = !cli_curses;
-			return 0;
-		case 0x32: // ins
-		case 0x33: // delete
-		case 0x34: // end
-		case 0x35: // pgup
-		case 0x36: // pgdn
-		case 0x43: // right
-		case 0x45: // 5
-			return 0;
-		}
-	}
+               switch (c) {
+               case 0x41: // up
+                       c = 0x10; /* arrow up = ctl-P */
+                       break;
+                case 0x42: // down
+                        c = 0x0e; /* arrow down = ctl-N */
+                        break;
+                case 0x44: // left
+                        c = 0x02; /* ctrl-B */
+                        break;
+                case 0x43: // right
+                        c = 0x06; /* ctrl-F */
+                        break;
+                case 0x48: // home
+                case 0x31: // home
+                        c = 0x01; /* ctrl-A */
+                        break;
+               case 0x46: // end
+               case 0x34: // end
+                       c = 0x05; /* ctrl-E */
+                       break;
+               case 0x33: // delete
+                       conn->status |= WAITING_ESC_DEL;
+                       return 0;
+               default:
+                       return 0;
+               }
+       } else if (conn->status & WAITING_ESC_DEL) {
+               conn->status &= ~WAITING_ESC_DEL;
+               if (c == '~') {
+                       if (conn->cursor < conn->pos) {
+                               memmove(&conn->inbuf[conn->cursor],
+                                       &conn->inbuf[conn->cursor + 1],
+                                       conn->pos - conn->cursor - 1);
+                               conn->pos--;
+                               conn->inbuf[conn->pos] = 0;
+                               refresh_line(conn);
+                       }
+               }
+               return 0;
+       }
 
 	if (c == 4) { /* ctl-D */
 		close_connection(conn);
 		return 0;
-	} else if (c == 0x10 || c == 0x0e) { /* ctl-P or ctl-N */
-		strcpy(conn->inbuf, conn->oldbuf[conn->old_get_cnt]);
-		if (c == 0x10) {
-			conn->old_get_cnt--;
-			if (conn->old_get_cnt < 0)
-				conn->old_get_cnt = NUM_OLD_BUFS - 1;
-		} else {
-			conn->old_get_cnt++;
-			if (conn->old_get_cnt >= NUM_OLD_BUFS)
-				conn->old_get_cnt = 0;
-		}
-		conn->pos = strlen(conn->inbuf);
-		sendstr(conn, "\r                                                                   ");
-		sendprompt(conn);
-		sendstr(conn, conn->inbuf);
+	} else if (c == 0x10) { /* ctl-P */
+		size_t index = conn->history_index;
+		if (index > 0)
+			index--;
+		history_select(conn, index);
+	} else if (c == 0x0e) { /* ctl-N */
+		size_t index = conn->history_index;
+		if (index < conn->history_len)
+			index++;
+		history_select(conn, index);
 	} else if (c == 0x1b) {
 		conn->status |= WAITING_ESC_1;
 	} else if (c == 0xff) {
@@ -1622,17 +1766,21 @@ static int cli_read(int fd)
 	if (conn->status & DO_ECHO)
 		send(fd, nl, sizeof(nl), 0);
 	conn->inbuf[conn->pos] = 0;
-	if (0 && conn->pos == 0) {
-		strcpy(conn->inbuf, conn->oldbuf[conn->old_put_cnt]);
-		conn->pos = strlen(conn->inbuf);
-		sendstr(conn, conn->inbuf);
-		send(fd, nl, sizeof(nl), 0);
-	} else if (conn->pos > 0 && strcmp(conn->oldbuf[conn->old_put_cnt], conn->inbuf)) {
-		conn->old_put_cnt++;
-		if (conn->old_put_cnt >= NUM_OLD_BUFS)
-			conn->old_put_cnt = 0;
-		strcpy(conn->oldbuf[conn->old_put_cnt], conn->inbuf);
+	if (cmd_log_fp && conn->pos) {
+		time_t now = time(NULL);
+		struct tm tm_now;
+		char tbuf[32];
+		localtime_r(&now, &tm_now);
+		strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &tm_now);
+		fprintf(cmd_log_fp, "%s %s\n", tbuf, conn->inbuf);
+		fflush(cmd_log_fp);
 	}
+	if (history_fp && conn->pos) {
+		fprintf(history_fp, "%s\n", conn->inbuf);
+		fflush(history_fp);
+	}
+	if (conn->pos > 0)
+		history_append(conn, conn->inbuf, 1);
 
 	if (conn->pos) {
 		parse(conn, 0);
@@ -1646,39 +1794,72 @@ static int cli_read(int fd)
 		sendcrlf(conn);
 
 	conn->pos = 0;
+	conn->cursor = 0;
+	conn->last_len = 0;
 	conn->inbuf[0] = 0;
-	conn->old_get_cnt = conn->old_put_cnt;
+	conn->history_index = conn->history_len;
 	} else if (c == 8 || c == 127) {
-		if (conn->pos > 0) {
-			char bs[] = {8, ' ', 8};
-			if (conn->status & DO_ECHO)
-				send(fd, bs, sizeof(bs), 0);
-			conn->pos--;
-			conn->inbuf[conn->pos] = 0;
-		}
+                if (conn->cursor > 0) {
+                        memmove(&conn->inbuf[conn->cursor - 1],
+                                &conn->inbuf[conn->cursor],
+                                conn->pos - conn->cursor);
+                        conn->pos--;
+                        conn->cursor--;
+                        conn->inbuf[conn->pos] = 0;
+                        refresh_line(conn);
+                }
+	} else if (c == 0x02) {
+                if (conn->cursor > 0) {
+                        conn->cursor--;
+                        refresh_line(conn);
+                }
+	} else if (c == 0x06) {
+                if (conn->cursor < conn->pos) {
+                        conn->cursor++;
+                        refresh_line(conn);
+                }
+	} else if (c == 0x01) {
+                if (conn->cursor) {
+                        conn->cursor = 0;
+                        refresh_line(conn);
+                }
+	} else if (c == 0x05) {
+                if (conn->cursor != conn->pos) {
+                        conn->cursor = conn->pos;
+                        refresh_line(conn);
+                }
 	} else if (c == '?' || c == '\t') {
-		parse(conn, c);
+                parse(conn, c);
 	} else if (c >= ' ' && c < 127) {
-		if (conn->pos < (sizeof(conn->inbuf) - 1)) {
-			conn->inbuf[conn->pos++] = c;
-			conn->inbuf[conn->pos] = 0;
-
-			if (conn->status & DO_ECHO)
-				send(fd, &c, 1, 0);
-		}
-	}
+                if (conn->pos < (sizeof(conn->inbuf) - 1)) {
+                        if (conn->cursor == conn->pos) {
+                                conn->inbuf[conn->pos++] = c;
+                        } else {
+                                memmove(&conn->inbuf[conn->cursor + 1],
+                                        &conn->inbuf[conn->cursor],
+                                        conn->pos - conn->cursor);
+                                conn->inbuf[conn->cursor] = c;
+                                conn->pos++;
+                        }
+                        conn->cursor++;
+                        conn->inbuf[conn->pos] = 0;
+                        refresh_line(conn);
+                }
+        }
 
 	return 0;
 }
 
 static void cli_sa_accept(int fd)
 {
-	struct cli_conn *conn;
+        struct cli_conn *conn;
 
-	conn = &connection;
-	bzero(conn, sizeof(*conn));
-	conn->fd = fd;
-	send(fd, telnet_echo_off, sizeof(telnet_echo_off), 0);
+        conn = &connection;
+        history_reset(conn);
+        bzero(conn, sizeof(*conn));
+       load_history(conn);
+        conn->fd = fd;
+        send(fd, telnet_echo_off, sizeof(telnet_echo_off), 0);
 
 	OFP_DBG("new sock %d opened\r\n", conn->fd);
 }
@@ -1703,9 +1884,27 @@ static int cli_server(void *arg)
 	struct ofp_global_config_mem *ofp_global_cfg = NULL;
 	int select_nfds;
 
-	close_cli = 0;
+        close_cli = 0;
 
-	file_name = (char *)arg;
+       /* Configure log and history paths from environment */
+       const char *env;
+       env = getenv("OFP_CLI_LOG");
+       if (env && *env)
+               cmd_log_path = env;
+       env = getenv("OFP_CLI_HISTORY");
+       if (env && *env)
+               history_path = env;
+
+       /* Open command log file */
+       cmd_log_fp = fopen(cmd_log_path, "a");
+       if (!cmd_log_fp)
+               OFP_ERR("Failed to open %s: %s", cmd_log_path, strerror(errno));
+
+       history_fp = fopen(history_path, "a+");
+       if (!history_fp)
+               OFP_ERR("Failed to open %s: %s", history_path, strerror(errno));
+
+        file_name = (char *)arg;
 
 	OFP_INFO("CLI server started on core %i\n", odp_cpu_id());
 
@@ -1812,14 +2011,19 @@ static int cli_server(void *arg)
 
 	if (cli_tmp_fd > 0)
 		close(cli_tmp_fd);
-	cli_tmp_fd = -1;
+       cli_tmp_fd = -1;
 
-	close(cli_serv_fd);
-	cli_serv_fd = -1;
+        close(cli_serv_fd);
+        cli_serv_fd = -1;
 
-	OFP_DBG("CLI server exiting");
-	ofp_term_local();
-	return 0;
+        OFP_DBG("CLI server exiting");
+	history_reset(&connection);
+	if (cmd_log_fp)
+		fclose(cmd_log_fp);
+	if (history_fp)
+		fclose(history_fp);
+       ofp_term_local();
+       return 0;
 }
 
 int ofp_start_cli_thread(odp_instance_t instance, int core_id, char *cli_file)

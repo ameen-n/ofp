@@ -9,11 +9,10 @@
 #define _CLI_H_
 
 #include <stdint.h>
+#include <stddef.h>
 #include "api/ofp_cli.h"
 
 #define PASSWORD_LEN 32
-
-#define NUM_OLD_BUFS 8
 
 /** cli_conn: CLI connection context
  */
@@ -21,12 +20,15 @@ struct cli_conn {
 	int           status;
 	int           fd;
 	char          inbuf[200];
-	char          oldbuf[NUM_OLD_BUFS][200];
-	int           old_put_cnt;
-	int           old_get_cnt;
-	unsigned int  pos;
-	unsigned char ch1;
-	char          passwd[PASSWORD_LEN + 1];
+        char        **history;
+        size_t        history_len;
+        size_t        history_cap;
+        size_t        history_index;
+        unsigned int  pos;
+        unsigned int  cursor;
+        unsigned int  last_len;
+        unsigned char ch1;
+        char          passwd[PASSWORD_LEN + 1];
 };
 
 /** utils

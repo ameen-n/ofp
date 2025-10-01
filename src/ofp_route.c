@@ -31,7 +31,17 @@
  * Structure definitions
  */
 struct routes_by_vrf {
-	struct ofp_rtl_tree routes;
+        struct ofp_rtl_tree routes;
+       struct {
+               uint32_t addr;
+               struct ofp_nh_entry *nh;
+               uint32_t gen;
+       } cache4;
+       struct {
+               uint8_t addr[16];
+               struct ofp_nh6_entry *nh;
+               uint32_t gen;
+       } cache6;
 };
 
 struct pkt6_entry {
@@ -65,8 +75,11 @@ struct vrf_route_mem {
 
 static __thread struct ofp_route_mem *shm;
 static __thread struct vrf_route_mem *vrf_shm;
+static __thread uint32_t local_gen4;
+static __thread uint32_t local_gen6;
 
 struct ofp_locks_str *ofp_locks_shm;
+static odp_atomic_u32_t route_cache_gen;
 
 #ifdef INET6
 static void route6_cleanup(int fd, uint8_t *key, int level,
@@ -122,18 +135,32 @@ int ofp_get_mac(struct ofp_ifnet *dev, struct ofp_nh_entry *nh_data,
 }
 
 struct ofp_nh6_entry *ofp_get_next_hop6(uint16_t vrf,
-	uint8_t *addr, uint32_t *flags)
+        uint8_t *addr, uint32_t *flags)
 {
-	struct ofp_nh6_entry *nh6;
+       struct ofp_nh6_entry *nh6;
+       uint32_t gen = odp_atomic_load_u32(&route_cache_gen);
 
-	(void) vrf;
-	(void) flags;
+       (void)vrf;
+       (void)flags;
 
-	OFP_LOCK_READ(route);
-	nh6 = ofp_rtl_search6(&shm->default_routes_6, addr);
-	OFP_UNLOCK_READ(route);
+       if (local_gen6 != gen) {
+               local_gen6 = gen;
+               vrf_shm->fib[0].cache6.gen = 0;
+       }
 
-	return nh6;
+       if (vrf_shm->fib[0].cache6.gen == gen &&
+           memcmp(vrf_shm->fib[0].cache6.addr, addr, 16) == 0)
+               return vrf_shm->fib[0].cache6.nh;
+
+       OFP_LOCK_READ(route);
+       nh6 = ofp_rtl_search6(&shm->default_routes_6, addr);
+       OFP_UNLOCK_READ(route);
+
+       vrf_shm->fib[0].cache6.gen = gen;
+       vrf_shm->fib[0].cache6.nh = nh6;
+       memcpy(vrf_shm->fib[0].cache6.addr, addr, 16);
+
+       return nh6;
 }
 
 #ifdef INET6
@@ -227,7 +254,8 @@ static int add_route(struct ofp_route_msg *msg)
 #ifdef MTRIE
 	ret = ofp_rt_rule_add(msg->vrf, msg->dst, msg->masklen, &tmp);
 #endif
-	OFP_UNLOCK_WRITE(route);
+       OFP_UNLOCK_WRITE(route);
+       odp_atomic_inc_u32(&route_cache_gen);
 	OFP_DBG("route_add_success = %d ret = %d tmp.port=%d tmp.vlan = %d \n",route_add_success,ret, tmp.port,tmp.vlan);
 	if (route_add_success && !ret) {
 		if ((tmp.flags & OFP_RTF_LOCAL) && (msg->masklen == 32)) {
@@ -265,7 +293,8 @@ static int del_route(struct ofp_route_msg *msg)
 	ofp_rt_rule_remove(msg->vrf, msg->dst, msg->masklen);
 #endif
 
-	OFP_UNLOCK_WRITE(route);
+       OFP_UNLOCK_WRITE(route);
+       odp_atomic_inc_u32(&route_cache_gen);
 
 	if (NULL != nh_data) {
 		if (nh_data->flags & OFP_RTF_LOCAL) {
@@ -304,9 +333,10 @@ static int add_route6(struct ofp_route_msg *msg)
 			msg->masklen, &tmp))
 		OFP_DBG("ofp_rtl_insert6 failed");
 
-	OFP_UNLOCK_WRITE(route);
+       OFP_UNLOCK_WRITE(route);
+       odp_atomic_inc_u32(&route_cache_gen);
 
-	return 0;
+       return 0;
 }
 
 static int del_route6(struct ofp_route_msg *msg)
@@ -330,9 +360,10 @@ static int del_route6(struct ofp_route_msg *msg)
 	} else
 		OFP_DBG("ofp_rtl_remove6 failed");
 
-	OFP_UNLOCK_WRITE(route);
+       OFP_UNLOCK_WRITE(route);
+       odp_atomic_inc_u32(&route_cache_gen);
 
-	return 0;
+       return 0;
 }
 
 enum ofp_return_code ofp_route_save_ipv6_pkt(odp_packet_t pkt,
@@ -443,20 +474,32 @@ void ofp_show_routes(int fd, int what)
 
 struct ofp_nh_entry *ofp_get_next_hop(uint16_t vrf, uint32_t addr, uint32_t *flags)
 {
-	(void) flags;
-	struct ofp_nh_entry *node;
-	struct routes_by_vrf *fib;
+       (void)flags;
+       struct ofp_nh_entry *node;
+       struct routes_by_vrf *fib = &vrf_shm->fib[vrf];
+       uint32_t gen = odp_atomic_load_u32(&route_cache_gen);
 
-	fib = &vrf_shm->fib[vrf];
+       if (local_gen4 != gen) {
+               local_gen4 = gen;
+               fib->cache4.gen = 0;
+       }
+
+       if (fib->cache4.gen == gen && fib->cache4.addr == addr)
+               return fib->cache4.nh;
+
 #ifndef MTRIE
-	OFP_LOCK_READ(route);
+       OFP_LOCK_READ(route);
 #endif
-	node = ofp_rtl_search(&fib->routes, addr);
+       node = ofp_rtl_search(&fib->routes, addr);
 #ifndef MTRIE
-	OFP_UNLOCK_READ(route);
+       OFP_UNLOCK_READ(route);
 #endif
 
-	return node;
+       fib->cache4.gen = gen;
+       fib->cache4.addr = addr;
+       fib->cache4.nh = node;
+
+       return node;
 }
 
 static int add_local_interface(struct ofp_route_msg *msg)
@@ -638,9 +681,21 @@ int ofp_route_init_global(void)
 		OFP_SLIST_INSERT_HEAD(&shm->pkt6.free_entries,
 			&shm->pkt6.entries[i], next);
 
-	memset(vrf_shm, 0, sizeof(*vrf_shm));
-	for (i = 0; i < global_param->num_vrf; i++)
-		(void) ofp_rtl_root_init(&vrf_shm->fib[i].routes, i);
+       memset(vrf_shm, 0, sizeof(*vrf_shm));
+       for (i = 0; i < global_param->num_vrf; i++) {
+               (void) ofp_rtl_root_init(&vrf_shm->fib[i].routes, i);
+               vrf_shm->fib[i].cache4.gen = 0;
+               vrf_shm->fib[i].cache4.nh = NULL;
+               vrf_shm->fib[i].cache4.addr = OFP_ROUTE_CACHE_INVALID;
+               vrf_shm->fib[i].cache6.gen = 0;
+               vrf_shm->fib[i].cache6.nh = NULL;
+               memset(vrf_shm->fib[i].cache6.addr, 0xff,
+                      sizeof(vrf_shm->fib[i].cache6.addr));
+       }
+
+       odp_atomic_init_u32(&route_cache_gen, 1);
+       local_gen4 = 0;
+       local_gen6 = 0;
 
 	return 0;
 }
